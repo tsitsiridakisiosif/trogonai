@@ -1,25 +1,8 @@
-//! Waiter registry for bridging prompt request/response over NATS notifications.
-//!
-//! **When to use**
-//! - In the ACP prompt path where request and response are decoupled (`publish` now, response
-//!   arrives later via `client.ext.session.prompt_response`).
-//! - Before publishing prompt work, so an immediate backend response cannot race ahead of waiter
-//!   registration.
-//!
-//! **Why this exists**
-//! - Prompt responses are correlated by `SessionId`, not by direct request/reply transport.
-//! - Enforcing one active waiter per session avoids ambiguous delivery when clients duplicate
-//!   prompt calls.
-//! - Timed-out sessions are tracked briefly to suppress noisy duplicate timeout-related warnings
-//!   during late-response windows.
-//! - Per-prompt correlation via `PromptToken` prevents late responses for prompt A from resolving
-//!   a newly registered prompt B for the same session.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use crate::config::PROMPT_TIMEOUT_WARNING_SUPPRESSION_WINDOW;
 use agent_client_protocol::{PromptResponse, SessionId};
 use tokio::sync::oneshot;
 use trogon_std::time::GetElapsed;
@@ -27,7 +10,8 @@ use trogon_std::time::GetElapsed;
 #[allow(dead_code)]
 type PromptResponseReceiver = oneshot::Receiver<std::result::Result<PromptResponse, String>>;
 
-/// Per-prompt correlation token. Ensures late responses for prompt A cannot resolve prompt B.
+const PROMPT_TIMEOUT_WARNING_SUPPRESSION_WINDOW: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub(crate) struct PromptToken(pub u64);
 
@@ -79,7 +63,6 @@ pub(crate) struct PendingSessionPromptResponseWaiters<I: Copy> {
 }
 
 impl<I: Copy> PendingSessionPromptResponseWaiters<I> {
-    /// Creates an empty waiter registry.
     pub fn new() -> Self {
         Self {
             waiters: Mutex::new(HashMap::new()),
@@ -155,7 +138,6 @@ impl<I: Copy> PendingSessionPromptResponseWaiters<I> {
         });
     }
 
-    /// Returns true if a late prompt response for this (session, token) should not emit a missing-waiter warning.
     pub(crate) fn should_suppress_missing_waiter_warning<C: GetElapsed<Instant = I>>(
         &self,
         session_id: &SessionId,
@@ -224,7 +206,7 @@ impl<I: Copy> PendingSessionPromptResponseWaiters<I> {
         let mut waiters = self.waiters.lock().unwrap();
         if waiters
             .get(session_id)
-            .is_some_and(|entry| entry.token == prompt_token)
+            .is_some_and(|e| e.token == prompt_token)
         {
             waiters.remove(session_id);
         }
@@ -262,40 +244,21 @@ mod tests {
     }
 
     #[test]
-    fn should_suppress_missing_waiter_after_timeout() {
+    fn register_waiter_rejects_duplicate_session() {
         let waiters = PendingSessionPromptResponseWaiters::<MockInstant>::new();
-        let clock = MockClock::new();
         let session_id = SessionId::from("s1");
-        let token = PromptToken(42);
-
-        assert!(!waiters.should_suppress_missing_waiter_warning(&session_id, token, &clock));
-        waiters.mark_prompt_waiter_timed_out(session_id.clone(), token, &clock);
-        assert!(waiters.should_suppress_missing_waiter_warning(&session_id, token, &clock));
-    }
-
-    #[tokio::test]
-    async fn register_waiter_clears_stale_timed_out_entries() {
-        let waiters = PendingSessionPromptResponseWaiters::<MockInstant>::new();
-        let clock = MockClock::new();
-        let session_id = SessionId::from("s1");
-
-        let (_rx, _guard, token) = waiters.register_waiter(session_id.clone()).unwrap();
-        waiters.mark_prompt_waiter_timed_out(session_id.clone(), token, &clock);
-        assert_eq!(waiters.timed_out.lock().unwrap().len(), 1);
-
-        waiters.remove_waiter_for_test(&session_id);
-        let (_rx2, _guard2, _token2) = waiters.register_waiter(session_id.clone()).unwrap();
-        assert!(
-            waiters.timed_out.lock().unwrap().is_empty(),
-            "register_waiter should have cleared timed_out entries for the session"
-        );
+        let (_rx, _guard, _token) = waiters.register_waiter(session_id.clone()).unwrap();
+        assert!(waiters.register_waiter(session_id).is_err());
     }
 
     #[test]
     fn purge_expired_timed_out_waiters_removes_expired_markers() {
         let waiters = PendingSessionPromptResponseWaiters::<MockInstant>::new();
         let clock = MockClock::new();
-        waiters.mark_prompt_waiter_timed_out(SessionId::from("s1"), PromptToken(0), &clock);
+        {
+            let mut timed_out = waiters.timed_out.lock().unwrap();
+            timed_out.insert((SessionId::from("s1"), PromptToken(0)), clock.now());
+        }
         assert_eq!(waiters.timed_out.lock().unwrap().len(), 1);
 
         clock.advance(PROMPT_TIMEOUT_WARNING_SUPPRESSION_WINDOW + Duration::from_millis(1));
